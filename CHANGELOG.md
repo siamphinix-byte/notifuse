@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [32.3] - 2026-06-01
 
+- **Fix**: Broadcasts to a double opt-in list no longer reach contacts who never confirmed — recipients whose `contact_list` status is `pending` are now excluded from both the recipient count and the send (#344).
 - **Improvement**: `{{ workspace.base_url }}` / `{{ workspace.website_url }}` now render in the template preview — the `/api/templates.compile` endpoint injects the workspace object server-side (filling only missing keys, so historical message snapshots are preserved), so any API consumer gets it, not just the console, and the Preview tab no longer renders `website_url` as empty (#342).
 - **Refactor**: Extracted shared `WorkspaceSettings.ResolveEndpoint` and `BuildWorkspaceTemplateVars` helpers, replacing ~8 duplicated copies of the tracking-endpoint resolution and `workspace` template-object construction across the send and preview paths.
 
