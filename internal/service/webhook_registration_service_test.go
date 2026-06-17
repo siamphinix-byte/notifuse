@@ -204,6 +204,82 @@ func TestWebhookRegistrationService_RegisterWebhooks(t *testing.T) {
 	}
 }
 
+// fakeInboundProvider implements both WebhookProvider and InboundRouteRegistrar so we
+// can verify the orchestration layer invokes EnsureInboundRoute after RegisterWebhooks.
+type fakeInboundProvider struct {
+	status          *domain.WebhookRegistrationStatus
+	ensureErr       error
+	ensureCallCount int
+	gotInboundURL   string
+}
+
+func (f *fakeInboundProvider) RegisterWebhooks(_ context.Context, _, _ string, _ string, _ []domain.EmailEventType, _ *domain.EmailProvider) (*domain.WebhookRegistrationStatus, error) {
+	return f.status, nil
+}
+func (f *fakeInboundProvider) GetWebhookStatus(_ context.Context, _, _ string, _ *domain.EmailProvider) (*domain.WebhookRegistrationStatus, error) {
+	return f.status, nil
+}
+func (f *fakeInboundProvider) UnregisterWebhooks(_ context.Context, _, _ string, _ *domain.EmailProvider) error {
+	return nil
+}
+func (f *fakeInboundProvider) EnsureInboundRoute(_ context.Context, _ *domain.EmailProvider, inboundURL string) error {
+	f.ensureCallCount++
+	f.gotInboundURL = inboundURL
+	return f.ensureErr
+}
+
+func TestWebhookRegistrationService_RegisterWebhooks_RegistersInboundRoute(t *testing.T) {
+	ctx := context.Background()
+	const workspaceID, integrationID, apiEndpoint = "ws-1", "int-1", "https://api.notifuse.com"
+
+	newSvc := func(ctrl *gomock.Controller, provider domain.WebhookProvider) *WebhookRegistrationService {
+		mockWorkspaceRepo := mocks.NewMockWorkspaceRepository(ctrl)
+		mockAuthService := mocks.NewMockAuthService(ctrl)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(gomock.Any(), workspaceID).
+			Return(ctx, &domain.User{ID: "u"}, nil, nil)
+		workspace := &domain.Workspace{
+			ID:           workspaceID,
+			Integrations: domain.Integrations{{ID: integrationID, EmailProvider: domain.EmailProvider{Kind: domain.EmailProviderKindMailgun}}},
+		}
+		mockWorkspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspace, nil)
+		return &WebhookRegistrationService{
+			workspaceRepo:    mockWorkspaceRepo,
+			authService:      mockAuthService,
+			logger:           pkgmocks.NewMockLogger(ctrl),
+			apiEndpoint:      apiEndpoint,
+			webhookProviders: map[domain.EmailProviderKind]domain.WebhookProvider{domain.EmailProviderKindMailgun: provider},
+		}
+	}
+	config := &domain.WebhookRegistrationConfig{IntegrationID: integrationID, EventTypes: []domain.EmailEventType{domain.EmailEventDelivered}}
+
+	t.Run("invokes EnsureInboundRoute with the inbound URL", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		fake := &fakeInboundProvider{status: &domain.WebhookRegistrationStatus{IsRegistered: true}}
+		svc := newSvc(ctrl, fake)
+
+		result, err := svc.RegisterWebhooks(ctx, workspaceID, config)
+
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, 1, fake.ensureCallCount, "inbound route registration must run for a provider that supports it")
+		assert.Equal(t, domain.GenerateInboundWebhookURL(apiEndpoint, workspaceID, integrationID), fake.gotInboundURL)
+	})
+
+	t.Run("inbound route failure fails registration", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		fake := &fakeInboundProvider{status: &domain.WebhookRegistrationStatus{IsRegistered: true}, ensureErr: errors.New("routes API down")}
+		svc := newSvc(ctrl, fake)
+
+		result, err := svc.RegisterWebhooks(ctx, workspaceID, config)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "inbound reply route")
+		assert.Nil(t, result)
+	})
+}
+
 func TestWebhookRegistrationService_GetWebhookStatus(t *testing.T) {
 	// Setup
 	ctrl := gomock.NewController(t)

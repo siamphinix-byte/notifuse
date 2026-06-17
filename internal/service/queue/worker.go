@@ -47,11 +47,16 @@ type EmailQueueWorker struct {
 	workspaceRepo      domain.WorkspaceRepository
 	emailService       domain.EmailServiceInterface
 	messageHistoryRepo domain.MessageHistoryRepository
-	rateLimiter        *IntegrationRateLimiter
-	circuitBreaker     *IntegrationCircuitBreaker
-	errorClassifier    *emailerror.Classifier
-	config             *EmailQueueWorkerConfig
-	logger             logger.Logger
+	// automationRepo is optional; when set, the worker performs the stop-on-reply
+	// just-in-time guard before sending automation emails flagged with a
+	// contact_automation_id. Injected via SetAutomationRepo (kept out of the
+	// constructor to avoid churning every caller).
+	automationRepo  domain.AutomationRepository
+	rateLimiter     *IntegrationRateLimiter
+	circuitBreaker  *IntegrationCircuitBreaker
+	errorClassifier *emailerror.Classifier
+	config          *EmailQueueWorkerConfig
+	logger          logger.Logger
 
 	// Control
 	ctx     context.Context
@@ -252,6 +257,12 @@ func (w *EmailQueueWorker) processWorkspace(workspace *domain.Workspace) {
 }
 
 // processEntry processes a single queue entry
+// SetAutomationRepo injects the automation repository used by the stop-on-reply
+// just-in-time guard. Optional; when unset the guard is skipped.
+func (w *EmailQueueWorker) SetAutomationRepo(repo domain.AutomationRepository) {
+	w.automationRepo = repo
+}
+
 func (w *EmailQueueWorker) processEntry(workspace *domain.Workspace, entry *domain.EmailQueueEntry) {
 	// Get the integration to retrieve the email provider (needed for circuit breaker check)
 	integration := workspace.GetIntegrationByID(entry.IntegrationID)
@@ -318,6 +329,45 @@ func (w *EmailQueueWorker) processEntry(workspace *domain.Workspace, entry *doma
 		entry.ContactEmail,
 		&integration.EmailProvider,
 	)
+
+	// Stop-on-reply just-in-time guard: for automation sends flagged with a
+	// contact_automation_id, re-check the journey is still active right before
+	// sending. If a reply exited it after this email was enqueued, cancel the send.
+	if w.automationRepo != nil && entry.Payload.ContactAutomationID != nil {
+		ca, lookupErr := w.automationRepo.GetContactAutomation(w.ctx, workspace.ID, *entry.Payload.ContactAutomationID)
+		if lookupErr != nil {
+			// Fail open (send) but make it observable — a silent allow could mask a
+			// systematically broken guard.
+			w.logger.WithFields(map[string]interface{}{
+				"entry_id":              entry.ID,
+				"contact_automation_id": *entry.Payload.ContactAutomationID,
+				"error":                 lookupErr.Error(),
+			}).Warn("Stop-on-reply JIT guard lookup failed; proceeding with send (fail-open)")
+		} else if ca != nil && ca.Status != domain.ContactAutomationStatusActive {
+			w.logger.WithFields(map[string]interface{}{
+				"entry_id":              entry.ID,
+				"contact_automation_id": *entry.Payload.ContactAutomationID,
+				"status":                string(ca.Status),
+			}).Info("Skipping automation email: journey no longer active (stop-on-reply)")
+			// Remove the entry from the queue without sending.
+			if delErr := w.queueRepo.MarkAsSent(w.ctx, workspace.ID, entry.ID); delErr != nil {
+				w.logger.WithFields(map[string]interface{}{
+					"entry_id": entry.ID,
+					"error":    delErr.Error(),
+				}).Warn("Failed to remove cancelled (stop-on-reply) entry")
+			}
+			return
+		}
+	}
+
+	// Stop-on-reply: persist the matchable message_history row (carrying smtp_message_id)
+	// BEFORE the email physically leaves the provider, so a fast inbound reply (e.g. an
+	// auto-responder) can always resolve via GetBySMTPMessageID even if it arrives in the
+	// window before the post-send upsert. The post-send upsert below preserves the value
+	// (ON CONFLICT COALESCE). Only matters for automation sends where we set the Message-ID.
+	if entry.SourceType == domain.EmailQueueSourceAutomation && domain.ProviderSetsOwnMessageID(entry.ProviderKind) {
+		w.upsertMessageHistory(w.ctx, workspace.ID, workspace.Settings.SecretKey, entry, nil)
+	}
 
 	// Send the email
 	err := w.emailService.SendEmail(w.ctx, *request, true) // isMarketing = true
@@ -470,6 +520,17 @@ func (w *EmailQueueWorker) upsertMessageHistory(
 		}
 	} else if entry.SourceType == domain.EmailQueueSourceAutomation {
 		message.AutomationID = &entry.SourceID
+	}
+
+	// Record the recipient-visible Message-ID for ALL automation sends on providers
+	// where we set the Message-ID ourselves, so an inbound reply's In-Reply-To
+	// matches the exact source automation (not just exit_on_reply ones). This is
+	// what lets a reply to a non-exit_on_reply automation NOT wrongly exit a
+	// different exit_on_reply automation for the same contact.
+	if entry.SourceType == domain.EmailQueueSourceAutomation && domain.ProviderSetsOwnMessageID(entry.ProviderKind) {
+		// Store the bracket-free message-id value (matches a reply's parsed In-Reply-To).
+		smtpMessageID := domain.RFCMessageIDValue(entry.MessageID, entry.Payload.FromAddress)
+		message.SMTPMessageID = &smtpMessageID
 	}
 
 	// Set failure info if send failed (will be cleared on retry success via UPSERT)

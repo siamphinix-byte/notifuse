@@ -192,6 +192,35 @@ const EmailIntegration = ({
   }
 
   // Render webhook status
+  // Inbound (reply) forwarding status — Mailgun only. The "Register Webhooks" action also
+  // creates a Mailgun Route that forwards replies to Notifuse (for automation Exit-on-reply);
+  // surface whether that route exists, plus the manual MX-records prerequisite.
+  const renderInboundReplyStatus = () => {
+    if (provider.kind !== 'mailgun' || !webhookStatus) return null
+    const inboundRegistered = webhookStatus.provider_details?.inbound_registered === true
+    return (
+      <div className="mb-2">
+        <Tooltip
+          title={t`Forwards inbound replies to Notifuse so automations can stop when a contact replies (Exit on reply). Registering webhooks creates the Mailgun route; you must also point your domain's MX records at Mailgun.`}
+        >
+          <Tag bordered={false} color={inboundRegistered ? 'green' : 'orange'}>
+            {inboundRegistered ? (
+              <FontAwesomeIcon icon={faCheck} className="text-green-500 mr-1" />
+            ) : (
+              <FontAwesomeIcon icon={faExclamationTriangle} className="text-yellow-500 mr-1" />
+            )}
+            {t`inbound replies`}
+          </Tag>
+        </Tooltip>
+        <div className="text-xs text-gray-400 mt-1">
+          {inboundRegistered
+            ? t`Reply forwarding route is set up. Inbound replies also require your domain's MX records to point at Mailgun.`
+            : t`Click Register Webhooks to set up reply forwarding, then point your domain's MX records at Mailgun.`}
+        </div>
+      </div>
+    )
+  }
+
   const renderWebhookStatus = () => {
     if (loadingWebhooks) {
       return (
@@ -218,6 +247,7 @@ const EmailIntegration = ({
               {t`complaint`}
             </Tag>
           </div>
+          {renderInboundReplyStatus()}
           {isOwner && (
             <Button
               size="small"
@@ -257,6 +287,8 @@ const EmailIntegration = ({
               ))}
             </div>
           )}
+
+          {renderInboundReplyStatus()}
 
           <div className="mb-2">
             {isOwner && (

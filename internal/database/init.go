@@ -190,6 +190,7 @@ func InitializeWorkspaceDatabase(db *sql.DB) error {
 			id VARCHAR(255) NOT NULL PRIMARY KEY,
 			contact_email VARCHAR(255) NOT NULL,
 			external_id VARCHAR(255),
+			smtp_message_id VARCHAR(255),
 			broadcast_id VARCHAR(255),
 			automation_id VARCHAR(36),
 			transactional_notification_id VARCHAR(32),
@@ -218,6 +219,7 @@ func InitializeWorkspaceDatabase(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_message_history_transactional_notification_id ON message_history(transactional_notification_id) WHERE transactional_notification_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_message_history_template_id ON message_history(template_id, template_version)`,
 		`CREATE INDEX IF NOT EXISTS idx_message_history_created_at_id ON message_history(created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_message_history_smtp_message_id ON message_history(smtp_message_id) WHERE smtp_message_id IS NOT NULL`,
 		`CREATE TABLE IF NOT EXISTS transactional_notifications (
 			id VARCHAR(32) NOT NULL PRIMARY KEY,
 			name VARCHAR(255) NOT NULL,
@@ -249,6 +251,7 @@ func InitializeWorkspaceDatabase(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS inbound_webhook_events_type_idx ON inbound_webhook_events (type)`,
 		`CREATE INDEX IF NOT EXISTS inbound_webhook_events_timestamp_idx ON inbound_webhook_events (timestamp DESC)`,
 		`CREATE INDEX IF NOT EXISTS inbound_webhook_events_recipient_email_idx ON inbound_webhook_events (recipient_email)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS inbound_webhook_events_reply_dedup_idx ON inbound_webhook_events (integration_id, message_id) WHERE type IN ('reply', 'auto_reply') AND message_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcasts_status_testing ON broadcasts(status) WHERE status IN ('testing', 'test_completed', 'winner_selected')`,
 		`CREATE TABLE IF NOT EXISTS contact_timeline (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -400,6 +403,7 @@ func InitializeWorkspaceDatabase(db *sql.DB) error {
 			name VARCHAR(255) NOT NULL,
 			status VARCHAR(20) DEFAULT 'draft',
 			list_id VARCHAR(36),
+			exit_on_reply BOOLEAN NOT NULL DEFAULT false,
 			trigger_config JSONB NOT NULL,
 			trigger_sql TEXT,
 			root_node_id VARCHAR(36),
@@ -671,9 +675,20 @@ func InitializeWorkspaceDatabase(db *sql.DB) error {
 		DECLARE
 			changes_json JSONB := '{}'::jsonb;
 			entity_id_value VARCHAR(255);
+			kind_value VARCHAR(50);
 		BEGIN
 			-- Use message_id if available, otherwise use inbound webhook event id
 			entity_id_value := COALESCE(NEW.message_id, NEW.id::text);
+
+			-- Reply / auto-reply events get dedicated timeline kinds so automations
+			-- can react to them (stop-on-reply); other inbound events keep the generic kind.
+			IF NEW.type = 'reply' THEN
+				kind_value := 'email.replied';
+			ELSIF NEW.type = 'auto_reply' THEN
+				kind_value := 'email.auto_reply';
+			ELSE
+				kind_value := 'insert_inbound_webhook_event';
+			END IF;
 
 			changes_json := jsonb_build_object('type', jsonb_build_object('new', NEW.type), 'source', jsonb_build_object('new', NEW.source));
 			IF NEW.bounce_type IS NOT NULL AND NEW.bounce_type != '' THEN changes_json := changes_json || jsonb_build_object('bounce_type', jsonb_build_object('new', NEW.bounce_type)); END IF;
@@ -681,7 +696,7 @@ func InitializeWorkspaceDatabase(db *sql.DB) error {
 			IF NEW.bounce_diagnostic IS NOT NULL AND NEW.bounce_diagnostic != '' THEN changes_json := changes_json || jsonb_build_object('bounce_diagnostic', jsonb_build_object('new', NEW.bounce_diagnostic)); END IF;
 			IF NEW.complaint_feedback_type IS NOT NULL AND NEW.complaint_feedback_type != '' THEN changes_json := changes_json || jsonb_build_object('complaint_feedback_type', jsonb_build_object('new', NEW.complaint_feedback_type)); END IF;
 			INSERT INTO contact_timeline (email, operation, entity_type, kind, entity_id, changes, created_at)
-			VALUES (NEW.recipient_email, 'insert', 'inbound_webhook_event', 'insert_inbound_webhook_event', entity_id_value, changes_json, CURRENT_TIMESTAMP);
+			VALUES (NEW.recipient_email, 'insert', 'inbound_webhook_event', kind_value, entity_id_value, changes_json, CURRENT_TIMESTAMP);
 			RETURN NEW;
 		END;
 		$$ LANGUAGE plpgsql;`,

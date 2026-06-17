@@ -1075,6 +1075,18 @@ func WithMessageHistoryChannel(channel string) MessageHistoryOption {
 	}
 }
 
+func WithMessageHistorySMTPMessageID(smtpMessageID string) MessageHistoryOption {
+	return func(m *domain.MessageHistory) {
+		m.SMTPMessageID = &smtpMessageID
+	}
+}
+
+func WithMessageHistoryAutomationID(automationID string) MessageHistoryOption {
+	return func(m *domain.MessageHistory) {
+		m.AutomationID = &automationID
+	}
+}
+
 // ContactList options
 func WithContactListEmail(email string) ContactListOption {
 	return func(cl *domain.ContactList) {

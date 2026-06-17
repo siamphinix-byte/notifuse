@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [33.0] - 2026-06-16
+
+### Database Schema Changes
+
+- Migration v33.0 (workspace): adds `message_history.smtp_message_id` (with a partial index) for reply matching, `automations.exit_on_reply`, a partial unique index on `inbound_webhook_events` to dedup replayed replies, and redefines the `track_inbound_webhook_event_changes()` trigger so inbound events of type `reply`/`auto_reply` surface on the contact timeline as `email.replied`/`email.auto_reply`. Column adds are nullable/constant-default (instant, no table rewrite).
+
+### Features
+
+- **Feature**: Stop-on-reply for automations (#346). When a contact replies to a sequence email, the journey stops. Replies are ingested via a new public endpoint `POST /webhooks/email/inbound?workspace_id={id}&integration_id={id}` (Mailgun first; provider-agnostic parser registry for the rest). For Mailgun, the inbound Route that forwards replies to this endpoint is now created automatically by the same **Register Webhooks** action used for delivery/bounce webhooks (only the DNS MX records remain a manual step); the route is non-preemptive (no `stop()`, lower priority) so it never silently overrides other inbound consumers on a shared Mailgun domain. The public endpoint is rate-limited per source IP and per workspace, and permanent client errors return 4xx (not 5xx) so providers don't retry-loop. Inbound mail is classified so bounces and out-of-office auto-replies never count as a reply. A genuine reply is matched to the send strictly by `In-Reply-To`/`References` → the `Message-ID` stored at send time (persisted before the email is dispatched so even an instant reply matches), which both identifies the contact and scopes the exit to the exact automation that sent the replied-to email; replies that don't match a stored send are ignored, and a replayed/duplicate reply is deduplicated so it can't re-exit a re-enrolled journey. The matched reply is recorded on the contact timeline as `email.replied` and — when the automation has **Exit on reply** enabled — exits the contact's journey (bounded to journeys entered before the reply). The stop is enforced by a layered guarantee (event-driven interrupt + an active-guarded optimistic lock on the executor's happy *and* error paths + a just-in-time guard in the email queue worker) so it holds whether the contact is mid-delay or the next email is already queued, and a concurrent exit is never resurrected by a retry. The feature is free for workspaces that don't enable it (no extra per-send queries or index maintenance).
+
 ## [32.4] - 2026-06-15
 
 - **Feature**: `ROOT_EMAIL` now accepts multiple comma/semicolon-separated emails, so a shared self-hosted instance can have more than one root administrator without displacing the first. Root-gated actions (workspace creation, system settings, root HMAC sign-in) now check list membership instead of a single equality, and a user row is created on startup for every listed root so each can sign in immediately. Matching is case-sensitive and a single email behaves exactly as before. The console System Settings drawer edits the list as tags; the setup wizard still establishes the primary (first) root. Example: `ROOT_EMAIL=alice@example.com,bob@example.com` (#361).

@@ -1,6 +1,13 @@
 import { api } from './client'
 import { analyticsService } from './analytics'
 import { TreeNode } from './segment'
+import type { EmailProviderKind } from './workspace'
+
+// Email provider kinds that can ingest inbound replies (used to gate the automation
+// "Exit on reply" feature). Keep in sync with the backend: a provider belongs here once
+// it has a reply parser + a matchable stored Message-ID (and route registration).
+// More ESPs will be added as their inbound support ships.
+export const INBOUND_REPLY_PROVIDER_KINDS: EmailProviderKind[] = ['mailgun']
 
 // Automation status types
 export type AutomationStatus = 'draft' | 'live' | 'paused'
@@ -180,6 +187,7 @@ export interface Automation {
   name: string
   status: AutomationStatus
   list_id: string
+  exit_on_reply?: boolean // Stop the journey when the contact replies (requires inbound reply setup at the ESP)
   trigger?: TimelineTriggerConfig
   trigger_sql?: string
   root_node_id: string

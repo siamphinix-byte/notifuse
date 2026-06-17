@@ -9,11 +9,13 @@ import {
   App,
   Badge,
   Modal,
+  Switch,
   Tooltip
 } from 'antd'
+import { InfoCircleOutlined } from '@ant-design/icons'
 import { Undo2, Redo2 } from 'lucide-react'
 import { useLingui } from '@lingui/react/macro'
-import type { Automation } from '../../services/api/automation'
+import { type Automation, INBOUND_REPLY_PROVIDER_KINDS } from '../../services/api/automation'
 import type { Workspace, Template } from '../../services/api/types'
 import type { List } from '../../services/api/list'
 import type { Segment } from '../../services/api/segment'
@@ -43,7 +45,10 @@ function DrawerContent({ onCloseDrawer }: { onCloseDrawer: () => void }) {
     setName,
     listId,
     setListId,
+    exitOnReply,
+    setExitOnReply,
     lists,
+    workspace,
     hasUnsavedChanges,
     isSaving,
     save,
@@ -53,6 +58,12 @@ function DrawerContent({ onCloseDrawer }: { onCloseDrawer: () => void }) {
     undo,
     redo
   } = useAutomation()
+
+  // "Exit on reply" needs an email provider that can ingest inbound replies. Gate the
+  // toggle on the workspace having at least one such integration (more ESPs coming).
+  const hasInboundIntegration = (workspace?.integrations || []).some((i) =>
+    INBOUND_REPLY_PROVIDER_KINDS.includes(i.email_provider.kind)
+  )
 
   const { modal } = App.useApp()
 
@@ -187,6 +198,29 @@ function DrawerContent({ onCloseDrawer }: { onCloseDrawer: () => void }) {
                 label: list.name,
                 value: list.id
               }))}
+            />
+          </Form.Item>
+          <Form.Item
+            label={
+              <Space size={4}>
+                {t`Exit on reply`}
+                <Tooltip
+                  title={
+                    hasInboundIntegration
+                      ? t`Stops this automation for a contact as soon as they reply to one of its emails. This requires inbound reply forwarding to be configured at your email provider (ESP): replies to your sending domain must be routed to the provider, which forwards them to Notifuse. Without that setup, replies aren't detected and the sequence won't stop.`
+                      : t`Available once you connect an email provider that supports inbound replies (currently Mailgun — more providers coming soon). It stops this automation for a contact as soon as they reply to one of its emails.`
+                  }
+                >
+                  <InfoCircleOutlined style={{ color: '#8c8c8c' }} />
+                </Tooltip>
+              </Space>
+            }
+            style={{ marginBottom: 0 }}
+          >
+            <Switch
+              checked={exitOnReply && hasInboundIntegration}
+              onChange={setExitOnReply}
+              disabled={!hasInboundIntegration}
             />
           </Form.Item>
         </Form>

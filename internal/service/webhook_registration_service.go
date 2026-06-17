@@ -96,7 +96,23 @@ func (s *WebhookRegistrationService) RegisterWebhooks(
 	}
 
 	// Delegate to provider implementation with the provider configuration
-	return provider.RegisterWebhooks(ctx, workspaceID, config.IntegrationID, baseURL, config.EventTypes, emailProvider)
+	status, err := provider.RegisterWebhooks(ctx, workspaceID, config.IntegrationID, baseURL, config.EventTypes, emailProvider)
+	if err != nil {
+		return nil, err
+	}
+
+	// For providers whose inbound (reply) mail arrives via a provider-side route rather
+	// than an event webhook (e.g. Mailgun Routes), also register that route so
+	// stop-on-reply works without manual ESP setup. Providers that don't support this
+	// simply don't implement the interface, so this step is skipped for them.
+	if registrar, ok := provider.(domain.InboundRouteRegistrar); ok {
+		inboundURL := domain.GenerateInboundWebhookURL(baseURL, workspaceID, config.IntegrationID)
+		if err := registrar.EnsureInboundRoute(ctx, emailProvider, inboundURL); err != nil {
+			return nil, fmt.Errorf("failed to register inbound reply route: %w", err)
+		}
+	}
+
+	return status, nil
 }
 
 // GetWebhookStatus gets the status of webhooks for an email provider

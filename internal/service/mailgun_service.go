@@ -9,6 +9,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -571,6 +573,26 @@ func (s *MailgunService) GetWebhookStatus(
 		}
 	}
 
+	// Detect whether our inbound (reply) route is registered, so the UI can surface its
+	// state. The route is matched by the inbound path + this integration's IDs in the
+	// forward() action, so it works regardless of the configured host. Best-effort: a
+	// routes-list failure leaves it false rather than failing the whole status check.
+	inboundRegistered := false
+	if routes, rErr := s.listRoutes(ctx, *providerConfig.Mailgun); rErr != nil {
+		s.logger.WithField("error", rErr.Error()).Warn("Failed to list Mailgun routes for inbound status")
+	} else {
+		for _, r := range routes {
+			for _, action := range r.Actions {
+				if strings.Contains(action, "/webhooks/email/inbound") &&
+					strings.Contains(action, "workspace_id="+workspaceID) &&
+					strings.Contains(action, "integration_id="+integrationID) {
+					inboundRegistered = true
+				}
+			}
+		}
+	}
+	status.ProviderDetails["inbound_registered"] = inboundRegistered
+
 	return status, nil
 }
 
@@ -769,6 +791,10 @@ func (s *MailgunService) sendEmailSimple(ctx context.Context, apiURL string, req
 	// Add messageID as a custom variable for tracking
 	form.Add("v:notifuse_message_id", request.MessageID)
 
+	// Set a deterministic RFC Message-ID = <messageID@domain> so a reply's
+	// In-Reply-To echoes it and can be matched back to the send (stop-on-reply).
+	form.Add("h:Message-Id", domain.BuildRFCMessageID(request.MessageID, request.FromAddress))
+
 	// Create the request
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -857,6 +883,12 @@ func (s *MailgunService) sendEmailWithAttachments(ctx context.Context, apiURL st
 		return fmt.Errorf("failed to write message id field: %w", err)
 	}
 
+	// Set a deterministic RFC Message-ID = <messageID@domain> so a reply's
+	// In-Reply-To echoes it and can be matched back to the send (stop-on-reply).
+	if err := writer.WriteField("h:Message-Id", domain.BuildRFCMessageID(request.MessageID, request.FromAddress)); err != nil {
+		return fmt.Errorf("failed to write message-id header field: %w", err)
+	}
+
 	// Add attachments
 	for i, att := range request.EmailOptions.Attachments {
 		content, err := att.DecodeContent()
@@ -919,5 +951,138 @@ func (s *MailgunService) sendEmailWithAttachments(ctx context.Context, apiURL st
 		return fmt.Errorf("API returned non-OK status code %d", resp.StatusCode)
 	}
 
+	return nil
+}
+
+// mailgunAPIBase returns the region-specific Mailgun API v3 base URL.
+func mailgunAPIBase(region string) string {
+	if strings.ToLower(region) == "eu" {
+		return "https://api.eu.mailgun.net/v3"
+	}
+	return "https://api.mailgun.net/v3"
+}
+
+// mailgunRoute is a single Mailgun Route as returned by GET /v3/routes. Actions are
+// raw expression strings such as `forward("https://...")` and `stop()`.
+type mailgunRoute struct {
+	ID          string   `json:"id"`
+	Priority    int      `json:"priority"`
+	Description string   `json:"description"`
+	Expression  string   `json:"expression"`
+	Actions     []string `json:"actions"`
+}
+
+// mailgunRoutesPageSize is the page size for paginating GET /v3/routes.
+const mailgunRoutesPageSize = 1000
+
+// listRoutes returns all account-level Mailgun Routes (routes are not domain-scoped),
+// paging through skip/limit until the full set is fetched so the idempotency check below
+// never misses an existing route on accounts with many routes.
+func (s *MailgunService) listRoutes(ctx context.Context, config domain.MailgunSettings) ([]mailgunRoute, error) {
+	base := mailgunAPIBase(config.Region)
+	all := []mailgunRoute{}
+	for skip := 0; ; skip += mailgunRoutesPageSize {
+		apiURL := fmt.Sprintf("%s/routes?skip=%d&limit=%d", base, skip, mailgunRoutesPageSize)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		req.SetBasicAuth("api", config.APIKey)
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute request: %w", err)
+		}
+
+		var response struct {
+			Items      []mailgunRoute `json:"items"`
+			TotalCount int            `json:"total_count"`
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			s.logger.Error(fmt.Sprintf("Mailgun routes list returned non-OK status %d: %s", resp.StatusCode, string(body)))
+			return nil, fmt.Errorf("API returned non-OK status code %d", resp.StatusCode)
+		}
+		decErr := json.NewDecoder(resp.Body).Decode(&response)
+		_ = resp.Body.Close()
+		if decErr != nil {
+			return nil, fmt.Errorf("failed to decode routes response: %w", decErr)
+		}
+
+		all = append(all, response.Items...)
+		// Stop when this page was not full, or we've reached the reported total.
+		if len(response.Items) < mailgunRoutesPageSize || (response.TotalCount > 0 && len(all) >= response.TotalCount) {
+			break
+		}
+	}
+	return all, nil
+}
+
+// EnsureInboundRoute implements domain.InboundRouteRegistrar for Mailgun: it idempotently
+// creates a Route that forwards inbound mail for the integration's domain to inboundURL,
+// so replies reach the app's inbound endpoint without manual dashboard setup. It is a
+// no-op when a route already forwards to that exact URL. (DNS MX records pointing at
+// mxa/mxb.mailgun.org remain the operator's responsibility — Mailgun has no API for them.)
+func (s *MailgunService) EnsureInboundRoute(ctx context.Context, providerConfig *domain.EmailProvider, inboundURL string) error {
+	if providerConfig == nil || providerConfig.Mailgun == nil ||
+		providerConfig.Mailgun.APIKey == "" || providerConfig.Mailgun.Domain == "" {
+		return fmt.Errorf("mailgun configuration is missing or invalid")
+	}
+	config := *providerConfig.Mailgun
+
+	routes, err := s.listRoutes(ctx, config)
+	if err != nil {
+		return fmt.Errorf("failed to list Mailgun routes: %w", err)
+	}
+
+	forwardAction := fmt.Sprintf("forward(%q)", inboundURL)
+	for _, r := range routes {
+		if slices.Contains(r.Actions, forwardAction) {
+			return nil // already registered — no-op
+		}
+	}
+
+	// Create the route. match_recipient("^.*@domain$") catches replies addressed to any
+	// sender at this domain (replies may go to a custom Reply-To, not just a configured
+	// sender, so we match the whole domain rather than individual addresses). The domain
+	// is regex-escaped and the pattern anchored to avoid matching look-alike domains.
+	//
+	// Deliberately NO stop() and a non-zero (lower) priority: the route only *forwards* a
+	// copy to us and lets Mailgun continue evaluating any operator-defined routes on the
+	// same shared domain, so registering Notifuse webhooks never silently preempts another
+	// inbound consumer (support inbox, separate parse/store route).
+	// Built with literal quotes (not %q) so the regex backslash from QuoteMeta stays a
+	// single backslash (\.) — Mailgun's match_recipient wants raw regex, and %q would
+	// double-escape it to \\.
+	expression := `match_recipient("^.*@` + regexp.QuoteMeta(config.Domain) + `$")`
+	apiURL := fmt.Sprintf("%s/routes", mailgunAPIBase(config.Region))
+	form := url.Values{}
+	form.Add("priority", "10")
+	form.Add("description", fmt.Sprintf("Notifuse inbound replies (%s)", config.Domain))
+	form.Add("expression", expression)
+	form.Add("action", forwardAction)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.SetBasicAuth("api", config.APIKey)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		s.logger.Error(fmt.Sprintf("Mailgun route create returned non-OK status %d: %s", resp.StatusCode, string(body)))
+		return fmt.Errorf("API returned non-OK status code %d", resp.StatusCode)
+	}
 	return nil
 }

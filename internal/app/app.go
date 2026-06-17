@@ -472,13 +472,15 @@ func (a *App) InitServices() error {
 	a.rateLimiter = ratelimiter.NewRateLimiter()
 
 	// Configure policies for different use cases
-	a.rateLimiter.SetPolicy("signin", 5, 5*time.Minute)           // Strict auth
-	a.rateLimiter.SetPolicy("verify", 5, 5*time.Minute)           // Strict auth
-	a.rateLimiter.SetPolicy("smtp", 5, 1*time.Minute)             // SMTP bridge
+	a.rateLimiter.SetPolicy("signin", 5, 5*time.Minute)              // Strict auth
+	a.rateLimiter.SetPolicy("verify", 5, 5*time.Minute)              // Strict auth
+	a.rateLimiter.SetPolicy("smtp", 5, 1*time.Minute)                // SMTP bridge
 	a.rateLimiter.SetPolicy("subscribe:email", 10, 1*time.Minute)    // Public subscribe by email
-	a.rateLimiter.SetPolicy("subscribe:ip", 50, 1*time.Minute)      // Public subscribe by IP
+	a.rateLimiter.SetPolicy("subscribe:ip", 50, 1*time.Minute)       // Public subscribe by IP
 	a.rateLimiter.SetPolicy("preferences:email", 20, 1*time.Minute)  // Public preferences by email
-	a.rateLimiter.SetPolicy("preferences:ip", 100, 1*time.Minute)   // Public preferences by IP
+	a.rateLimiter.SetPolicy("preferences:ip", 100, 1*time.Minute)    // Public preferences by IP
+	a.rateLimiter.SetPolicy("inbound:ip", 240, 1*time.Minute)        // Public inbound replies by source IP (generous; providers share IPs)
+	a.rateLimiter.SetPolicy("inbound:workspace", 120, 1*time.Minute) // Public inbound replies by workspace
 
 	// Initialize user service
 	userServiceConfig := service.UserServiceConfig{
@@ -503,15 +505,15 @@ func (a *App) InitServices() error {
 	// Config tracks which values came from actual env vars (not database, not generated)
 	rootEmail, apiEndpoint, smtpHost, smtpUsername, smtpPassword, smtpFromEmail, smtpFromName, smtpPort, smtpUseTLS, smtpBridgeEnabled, smtpBridgeDomain, smtpBridgeTLSCertBase64, smtpBridgeTLSKeyBase64, smtpBridgePort := a.config.GetEnvValues()
 	envConfig := &service.EnvironmentConfig{
-		RootEmail:              rootEmail,
-		APIEndpoint:            apiEndpoint,
-		SMTPHost:               smtpHost,
-		SMTPPort:               smtpPort,
-		SMTPUsername:           smtpUsername,
-		SMTPPassword:           smtpPassword,
-		SMTPFromEmail:          smtpFromEmail,
-		SMTPFromName:           smtpFromName,
-		SMTPUseTLS:             smtpUseTLS,
+		RootEmail:               rootEmail,
+		APIEndpoint:             apiEndpoint,
+		SMTPHost:                smtpHost,
+		SMTPPort:                smtpPort,
+		SMTPUsername:            smtpUsername,
+		SMTPPassword:            smtpPassword,
+		SMTPFromEmail:           smtpFromEmail,
+		SMTPFromName:            smtpFromName,
+		SMTPUseTLS:              smtpUseTLS,
 		SMTPBridgeEnabled:       smtpBridgeEnabled,
 		SMTPBridgeDomain:        smtpBridgeDomain,
 		SMTPBridgePort:          smtpBridgePort,
@@ -678,6 +680,7 @@ func (a *App) InitServices() error {
 		a.workspaceRepo,
 		a.messageHistoryRepo,
 		a.contactRepo,
+		a.automationRepo,
 	)
 
 	// Initialize Supabase service (before workspace service)
@@ -945,6 +948,8 @@ func (a *App) InitServices() error {
 		queue.DefaultWorkerConfig(),
 		a.logger,
 	)
+	// Enable the stop-on-reply just-in-time guard for automation sends.
+	a.emailQueueWorker.SetAutomationRepo(a.automationRepo)
 
 	// Initialize automation service
 	a.automationService = service.NewAutomationService(
@@ -1126,7 +1131,7 @@ func (a *App) InitHandlers() error {
 		a.config.Security.SecretKey,
 	)
 	transactionalHandler := httpHandler.NewTransactionalNotificationHandler(a.transactionalNotificationService, getJWTSecret, a.logger, a.config.IsDemo())
-	inboundWebhookEventHandler := httpHandler.NewInboundWebhookEventHandler(a.inboundWebhookEventService, getJWTSecret, a.logger)
+	inboundWebhookEventHandler := httpHandler.NewInboundWebhookEventHandler(a.inboundWebhookEventService, getJWTSecret, a.rateLimiter, a.logger)
 	webhookRegistrationHandler := httpHandler.NewWebhookRegistrationHandler(a.webhookRegistrationService, getJWTSecret, a.logger)
 	supabaseWebhookHandler := httpHandler.NewSupabaseWebhookHandler(a.supabaseService, a.logger)
 	messageHistoryHandler := httpHandler.NewMessageHistoryHandler(
