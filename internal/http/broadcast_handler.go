@@ -81,9 +81,13 @@ func (h *BroadcastHandler) HandleList(w http.ResponseWriter, r *http.Request) {
 	params := domain.ListBroadcastsParams{
 		WorkspaceID:   req.WorkspaceID,
 		Status:        domain.BroadcastStatus(req.Status),
+		Search:        req.Search,
 		Limit:         req.Limit,
 		Offset:        req.Offset,
 		WithTemplates: req.WithTemplates,
+	}
+	for _, s := range req.Statuses {
+		params.Statuses = append(params.Statuses, domain.BroadcastStatus(s))
 	}
 
 	response, err := h.service.ListBroadcasts(r.Context(), params)
@@ -97,8 +101,16 @@ func (h *BroadcastHandler) HandleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ensure broadcasts serializes as [] (not null) when empty so the response
+	// always matches the documented array shape, e.g. when a status filter or
+	// search matches nothing.
+	broadcasts := response.Broadcasts
+	if broadcasts == nil {
+		broadcasts = []*domain.Broadcast{}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"broadcasts":  response.Broadcasts,
+		"broadcasts":  broadcasts,
 		"total_count": response.TotalCount,
 	})
 }

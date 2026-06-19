@@ -141,6 +141,57 @@ func TestHandleList(t *testing.T) {
 		assert.Contains(t, response, "total_count")
 	})
 
+	// Test multi-status filtering and name search
+	t.Run("WithStatusesAndSearch", func(t *testing.T) {
+		mockService.EXPECT().
+			ListBroadcasts(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, params domain.ListBroadcastsParams) (*domain.BroadcastListResponse, error) {
+				assert.Equal(t, "workspace123", params.WorkspaceID)
+				assert.Equal(t, []domain.BroadcastStatus{
+					domain.BroadcastStatusProcessing,
+					domain.BroadcastStatusPaused,
+				}, params.Statuses)
+				// Multi-status request must not leave a malformed single Status.
+				assert.Equal(t, domain.BroadcastStatus(""), params.Status)
+				assert.Equal(t, "promo", params.Search)
+				return responseWithTotal, nil
+			})
+
+		req := httptest.NewRequest(http.MethodGet, "/api/broadcasts.list?workspace_id=workspace123&status=processing,paused&search=promo", nil)
+		w := httptest.NewRecorder()
+
+		handler.HandleList(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+	})
+
+	// Empty result set must serialize broadcasts as [] (not null)
+	t.Run("EmptyResultSerializesAsArray", func(t *testing.T) {
+		mockService.EXPECT().
+			ListBroadcasts(gomock.Any(), gomock.Any()).
+			Return(&domain.BroadcastListResponse{Broadcasts: nil, TotalCount: 0}, nil)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/broadcasts.list?workspace_id=workspace123&status=draft", nil)
+		w := httptest.NewRecorder()
+
+		handler.HandleList(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		// The raw body must contain an empty array, never null.
+		assert.Contains(t, w.Body.String(), `"broadcasts":[]`)
+		assert.NotContains(t, w.Body.String(), `"broadcasts":null`)
+	})
+
+	// Unknown status filter is rejected with 400 (no service call)
+	t.Run("InvalidStatusParam", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/broadcasts.list?workspace_id=workspace123&status=bogus", nil)
+		w := httptest.NewRecorder()
+
+		handler.HandleList(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
 	// Test invalid pagination parameters
 	t.Run("InvalidPaginationParams", func(t *testing.T) {
 		// Create a test request with invalid pagination parameters

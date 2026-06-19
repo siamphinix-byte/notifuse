@@ -54,6 +54,11 @@ export interface FileManagerSearch {
   path?: string
 }
 
+export interface BroadcastsSearch {
+  status?: string
+  q?: string
+}
+
 // Create the root route
 const rootRoute = createRootRoute({
   component: RootLayout
@@ -125,7 +130,19 @@ const workspaceIndexRoute = createRoute({
 const workspaceBroadcastsRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: '/broadcasts',
-  component: BroadcastsPage
+  component: BroadcastsPage,
+  validateSearch: (search: Record<string, unknown>): BroadcastsSearch => {
+    // Repeated query keys (?status=a&status=b) parse to arrays; coerce to a
+    // single value, trim, and drop empties so the page always sees a clean
+    // string or undefined.
+    const normalize = (value: unknown): string | undefined => {
+      const single = Array.isArray(value) ? value[0] : value
+      if (typeof single !== 'string') return undefined
+      const trimmed = single.trim()
+      return trimmed === '' ? undefined : trimmed
+    }
+    return { status: normalize(search.status), q: normalize(search.q) }
+  }
 })
 
 const workspaceAutomationsRoute = createRoute({
